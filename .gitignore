@@ -1,0 +1,14 @@
+.idea
+__pycache__
+*.spec
+backup
+/env
+/config.ini
+/resources
+/Cache
+/Temp
+*.ipyb
+pac.bat
+venv
+/dist
+/build
