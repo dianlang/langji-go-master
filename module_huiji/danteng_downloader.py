@@ -23,11 +23,18 @@ class Downloader(ObjectDanteng):
         self._block_size = size
 
     # 尝试下载
-    def download(self, url, path, filename, headers={}, log_handle=None, fallback_url=None):
-        return self.download_multi_copies(url, [os.path.join(path, filename)], headers=headers, log_handle=log_handle, fallback_url=fallback_url)
+    def download(self, url, path, filename, headers={}, log_handle=None, fallback_url=None, write_skip_log=True):
+        return self.download_multi_copies(
+            url,
+            [os.path.join(path, filename)],
+            headers=headers,
+            log_handle=log_handle,
+            fallback_url=fallback_url,
+            write_skip_log=write_skip_log,
+        )
 
     # 多保存目标下载
-    def download_multi_copies(self, url, save_list, headers={}, log_handle=None, fallback_url=None):
+    def download_multi_copies(self, url, save_list, headers={}, log_handle=None, fallback_url=None, write_skip_log=True):
         if len(save_list) == 0:
             return False
         filename = os.path.split(save_list[0])[1]
@@ -40,6 +47,7 @@ class Downloader(ObjectDanteng):
             'segment': False,
             'headers': headers,
             'log_handle': log_handle,
+            'write_skip_log': write_skip_log,
         }
         self._que_in.put(args)
         self._start_thread()
@@ -79,6 +87,8 @@ class DownloaderThread(ThreadDanteng):
             self._segment_download(args)
 
     def _write_skip_log(self, args):
+        if not args.get('write_skip_log', True):
+            return
         if args.get('log_handle') is not None:
             args['log_handle'].write(args['url'] + '\n')
             args['log_handle'].flush()
@@ -109,7 +119,11 @@ class DownloaderThread(ThreadDanteng):
                     self._log('<%s>文件不存在（404），已跳过！' % args['filename'])
                     return False
                 else:
-                    print('%s 下载出错，请检查' % response.status_code)
+                    if count < self._try_count:
+                        self._log('<%s>下载时返回HTTP %s，第%d次重试！' % (args['filename'], response.status_code, count))
+                    else:
+                        self._log('<%s>下载时连续返回HTTP %s，已跳过！' % (args['filename'], response.status_code))
+                        return False
             except Exception as e:  # 超时重新下载
                 if count < self._try_count:
                     self._log('<%s>下载时，连接超时%d次，正在重试！' % (args['filename'], count))
@@ -119,7 +133,7 @@ class DownloaderThread(ThreadDanteng):
 
         try:
             file_size = int(response.headers.get('Content-Length'))
-        except TypeError:
+        except (TypeError, ValueError):
             file_size = 0
         if file_size < args['block_size'] or args['block_size'] < 0:
             download_response = self._download(args)
@@ -173,13 +187,16 @@ class DownloaderThread(ThreadDanteng):
                         continue
                     return {'stat': False, 'msg': '404 目标不存在'}
                 else:
-                    print('%s 下载出错，请检查' % response.status_code)
+                    if count < self._try_count:
+                        self._log('<%s>下载时返回HTTP %s，第%d次重试！' % (args['filename'], response.status_code, count))
+                    else:
+                        return {'stat': False, 'msg': 'HTTP %s' % response.status_code}
             except Exception as e:  # 超时重新下载
                 if count < self._try_count:
                     self._log('<%s>下载时，连接超时%d次，正在重试！' % (args['filename'], count))
                 else:
                     self._log('<%s>下载时，连接超时%d次，已跳过！' % (args['filename'], count))
-                    return {'stat': False, 'content': ''}
+                    return {'stat': False, 'msg': '连接超时'}
         return {'stat': True, 'content': response.content}
 
     def _segment_download(self, args):
