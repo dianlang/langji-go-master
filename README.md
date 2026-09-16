@@ -18,6 +18,28 @@ pip install -r requirements.txt
 
 请参考范例运行目录的说明和bat指令
 
+## 图片下载
+
+下载指定类型图片：
+
+```bash
+python vajra_go.py image <类型>
+```
+
+例如下载技能图标：
+
+```bash
+python vajra_go.py image skill
+```
+
+下载战斗状态/Buff图标：
+
+```bash
+python vajra_go.py image status
+```
+
+`status` 会读取 [GBFAL](https://github.com/MizaGBF/GBFAL) 的 `buffs` 索引，只请求 GBFAL 已确认存在的状态图标及其特殊后缀，避免对 CDN 进行大范围暴力枚举。图片保存到 `IMAGE/status/`；当 `config.ini` 的 `[IMAGE] new=yes` 时，新下载文件也会写入 `IMAGE/new/`。
+
 # 打包
 脚本使用pyinstaller打包，打包指令附于pack.bat中
 
