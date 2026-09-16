@@ -50,11 +50,11 @@ class ObjectDanteng(object):
                 t = self._threads[t_index]
                 if t.is_alive():
                     new_threads.append(t)
-                    t.setName('线程-%02d' % (len(new_threads) + 1))
+                    t.name = '线程-%02d' % (len(new_threads) + 1)
             self._threads = new_threads
         if len(self._threads) < self._max_threads_number:
             t = self._thread_do()
-            t.setName('线程-%02d' % (len(self._threads) + 1))
+            t.name = '线程-%02d' % (len(self._threads) + 1)
             t.start()
             self._threads.append(t)
 
@@ -121,12 +121,17 @@ class ThreadDanteng(threading.Thread):
         print(log_str)
 
     def run(self):
+        # queue.empty() 在多线程中不可靠：两个线程可能同时看到“非空”，
+        # 随后其中一个在线程 get() 处永久阻塞。用 get_nowait() 原子地取任务。
         while True:
-            if not self._que_in.empty():
-                self._exec(self._que_in.get())
-                self._que_in.task_done()
-            else:
+            try:
+                args = self._que_in.get_nowait()
+            except queue.Empty:
                 break
+            try:
+                self._exec(args)
+            finally:
+                self._que_in.task_done()
 
     # 执行入口
     def _exec(self, args):
