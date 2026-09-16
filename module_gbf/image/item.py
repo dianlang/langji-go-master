@@ -1,11 +1,9 @@
 from module_huiji.danteng_downloader import Downloader
 from module_huiji.huijiWikiTabx import HuijiWikiTabx
-from ..util import get_skip_list
+from module_huiji.danteng_lib import log
 import os
-import re
 import shutil
-from config import IMAGE_PATH, IMAGE_NEW_PATH, IMAGE_WEAPON_SKILL_PATH, DATA_PATH, GBF_CDN_URL
-from ..data.sim import GBFSim
+from config import IMAGE_PATH, IMAGE_NEW_PATH, GBF_CDN_URL
 
 
 def item(cfg):
@@ -15,11 +13,12 @@ def item(cfg):
         if 'retry' in cfg['IMAGE']:
             try:
                 retry_times = int(cfg['IMAGE']['retry'])
-            except:
+            except (TypeError, ValueError):
                 pass
 
     # 先检查本地
     data_base_path = os.path.join(IMAGE_PATH, 'item')
+    os.makedirs(data_base_path, exist_ok=True)
     image_base_url = f'{GBF_CDN_URL}/assets/img/sp/assets/item/'
 
     # 配置下载器
@@ -64,8 +63,7 @@ def item(cfg):
         for filename in all_sub_list:
             if filename in checked_data[sub_name]:
                 continue
-            else:
-                checked_data[sub_name].append(filename)
+            checked_data[sub_name].append(filename)
 
             src_m_path = os.path.join(data_base_path, f'{sub_name}_m', filename)
             src_s_path = os.path.join(data_base_path, f'{sub_name}_s', filename)
@@ -84,8 +82,14 @@ def item(cfg):
         for filename in all_sub_list:
             dst_filename = filename.replace('item_', '')
             for sub_type in ['s', 'm']:
-
                 src_path = os.path.join(data_base_path, f'{sub_name}_{sub_type}', filename)
+
+                # 某些道具只存在 s 或 m 其中一种。旧逻辑会在另一种 404 后
+                # 继续 copy2()，从而用 FileNotFoundError 中断整个 item 更新。
+                if not os.path.exists(src_path):
+                    log('道具图标不存在，跳过：%s' % src_path)
+                    continue
+
                 if sub_name == 'article':
                     dst_path = os.path.join(data_base_path, 'wiki', f'IT_{sub_type}_{dst_filename}')
                     new_path = os.path.join(IMAGE_PATH, IMAGE_NEW_PATH, f'IT_{sub_type}_{dst_filename}')
@@ -96,6 +100,8 @@ def item(cfg):
                 if os.path.exists(dst_path):
                     continue
 
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                os.makedirs(os.path.dirname(new_path), exist_ok=True)
                 shutil.copy2(src_path, dst_path)
                 shutil.copy2(src_path, new_path)
 
