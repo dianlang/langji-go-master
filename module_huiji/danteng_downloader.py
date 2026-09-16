@@ -162,24 +162,43 @@ class DownloaderThread(ThreadDanteng):
 
             self._log('文件<%s>下载成功！' % args['filename'])
             return True
-        else:
-            block_num = (file_size + args['block_size'] - 1) // args['block_size']
-            self._log('文件<%s>大小：%s，分为%d块进行下载' % (args['filename'], get_size_desc(file_size), block_num))
-            segment_downloader = Downloader(title=args['filename'])
-            segment_downloader.set_thread_number(10)
-            for i in range(block_num):
-                segment_downloader.segment_download(args['url'], args['filename'], i, block_num)
-            segment_downloader.wait_threads()
-            segment_data = segment_downloader.get_result()
-            segment_data.sort(key=lambda s: s['s_index'])
-            self._log('开始保存文件<%s>...' % args['filename'])
 
-            for save_path in args['save_list']:
-                check_folder(save_path, 1)
-                with open(save_path, 'wb') as file:
-                    file.write(b''.join([s['content'] for s in segment_data]))
+        block_num = (file_size + args['block_size'] - 1) // args['block_size']
+        self._log('文件<%s>大小：%s，分为%d块进行下载' % (args['filename'], get_size_desc(file_size), block_num))
+        segment_downloader = Downloader(title=args['filename'])
+        segment_downloader.set_thread_number(10)
+        segment_downloader.set_try_count(self._try_count)
+        segment_downloader.set_block_size(args['block_size'])
+        for i in range(block_num):
+            segment_downloader.segment_download(args['url'], args['filename'], i, block_num)
+        segment_downloader.wait_threads()
+        segment_data = segment_downloader.get_result()
+        segment_data.sort(key=lambda s: s['s_index'])
 
-            self._log('文件<%s>下载成功！' % args['filename'])
+        # 任意一个分块失败都不能继续写文件，否则会生成一个“看起来下载成功”的损坏文件。
+        received_indexes = [s['s_index'] for s in segment_data]
+        if received_indexes != list(range(block_num)):
+            missing_indexes = sorted(set(range(block_num)) - set(received_indexes))
+            self._log('文件<%s>分块不完整，缺少块：%s，已放弃保存！' % (
+                args['filename'], ','.join(str(i + 1) for i in missing_indexes)
+            ))
+            return False
+
+        content = b''.join([s['content'] for s in segment_data])
+        if file_size > 0 and len(content) != file_size:
+            self._log('文件<%s>分块合并后大小异常（预期%d，实际%d），已放弃保存！' % (
+                args['filename'], file_size, len(content)
+            ))
+            return False
+
+        self._log('开始保存文件<%s>...' % args['filename'])
+        for save_path in args['save_list']:
+            check_folder(save_path, 1)
+            with open(save_path, 'wb') as file:
+                file.write(content)
+
+        self._log('文件<%s>下载成功！' % args['filename'])
+        return True
 
     def _download(self, args):
         headers = args.get('headers', {})
@@ -188,9 +207,17 @@ class DownloaderThread(ThreadDanteng):
             count += 1
             try:
                 response = requests.get(args['url'], headers=headers, timeout=30, verify=False)
-                if response.status_code in [200, 206]:
+                # 分块请求必须得到 206。若服务端忽略 Range 返回 200，继续拼接会把
+                # 多份完整文件串在一起，因此直接判定失败。
+                if args.get('segment'):
+                    if response.status_code == 206:
+                        break
+                    if response.status_code == 200:
+                        return {'stat': False, 'msg': '服务器忽略 Range 请求（HTTP 200）'}
+                elif response.status_code in [200, 206]:
                     break
-                elif response.status_code in [404]:
+
+                if response.status_code == 404:
                     if args.get('fallback_url'):
                         self._log('<%s>文件获取失败（404），更换备用URL重新尝试...' % args['filename'])
                         args['url'] = args['fallback_url']
@@ -198,11 +225,11 @@ class DownloaderThread(ThreadDanteng):
                         count = 0  # 重置超时计数
                         continue
                     return {'stat': False, 'msg': '404 目标不存在'}
+
+                if count < self._try_count:
+                    self._log('<%s>下载时返回HTTP %s，第%d次重试！' % (args['filename'], response.status_code, count))
                 else:
-                    if count < self._try_count:
-                        self._log('<%s>下载时返回HTTP %s，第%d次重试！' % (args['filename'], response.status_code, count))
-                    else:
-                        return {'stat': False, 'msg': 'HTTP %s' % response.status_code}
+                    return {'stat': False, 'msg': 'HTTP %s' % response.status_code}
             except Exception:  # 超时重新下载
                 if count < self._try_count:
                     self._log('<%s>下载时，连接超时%d次，正在重试！' % (args['filename'], count))
