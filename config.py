@@ -11,6 +11,7 @@ IMAGE_SUMMON_PATH = 'summon'
 IMAGE_WEAPON_PATH = 'weapon'
 IMAGE_WEAPON_SKILL_PATH = 'weapon_skill_en'
 IMAGE_SKILL_PATH = 'skill'
+IMAGE_STATUS_PATH = 'status'
 
 DATA_PATH = 'data'
 
