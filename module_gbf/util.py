@@ -44,10 +44,11 @@ def _read_skip_lines(path):
 
 
 # 获取图片跳过的文件地址
-def get_skip_list():
+def get_skip_list(include_log=True):
     skip_urls = []
     skip_urls.extend(_read_skip_lines(SKIP_LIST_PATH))
-    skip_urls.extend(_read_skip_lines(SKIP_LOG))
+    if include_log:
+        skip_urls.extend(_read_skip_lines(SKIP_LOG))
 
     # 去重并保持顺序
     dedup_urls = list(dict.fromkeys(skip_urls))
