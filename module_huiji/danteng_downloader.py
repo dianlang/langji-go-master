@@ -17,13 +17,13 @@ class Downloader(ObjectDanteng):
         self._block_size = 1024 * 1024 * 5  # 默认5M一个块
 
     def set_try_count(self, number):
-        self._try_count = number
+        self._try_count = max(1, int(number))
 
     def set_block_size(self, size):
         self._block_size = size
 
     # 尝试下载
-    def download(self, url, path, filename, headers={}, log_handle=None, fallback_url=None, write_skip_log=True):
+    def download(self, url, path, filename, headers=None, log_handle=None, fallback_url=None, write_skip_log=True):
         return self.download_multi_copies(
             url,
             [os.path.join(path, filename)],
@@ -34,7 +34,7 @@ class Downloader(ObjectDanteng):
         )
 
     # 多保存目标下载
-    def download_multi_copies(self, url, save_list, headers={}, log_handle=None, fallback_url=None, write_skip_log=True):
+    def download_multi_copies(self, url, save_list, headers=None, log_handle=None, fallback_url=None, write_skip_log=True):
         if len(save_list) == 0:
             return False
         filename = os.path.split(save_list[0])[1]
@@ -45,7 +45,7 @@ class Downloader(ObjectDanteng):
             'save_list': save_list,
             'block_size': self._block_size,
             'segment': False,
-            'headers': headers,
+            'headers': headers or {},
             'log_handle': log_handle,
             'write_skip_log': write_skip_log,
         }
@@ -97,34 +97,46 @@ class DownloaderThread(ThreadDanteng):
             skip_log_f.write(args['url'] + '\n')
 
     def _head(self, args):
-        if 'headers' in args:
-            headers = args['headers']
-        else:
-            headers = {}
+        headers = args.get('headers', {})
         count = 0
+        response = None
         while True:
             count += 1
             try:
-                response = requests.get(args['url'], headers=headers, timeout=30, verify=False)
+                # 这里只探测状态码和 Content-Length。旧实现使用普通 GET，
+                # requests 会先把整个文件读入内存，随后 _download() 又下载一遍。
+                response = requests.get(
+                    args['url'],
+                    headers=headers,
+                    timeout=30,
+                    verify=False,
+                    stream=True,
+                )
                 if response.status_code == 200:
                     break
                 elif response.status_code == 404:
+                    response.close()
                     if args.get('fallback_url'):
                         self._log('<%s>文件获取失败（404），更换备用URL重新尝试...' % args['filename'])
                         args['url'] = args['fallback_url']
-                        args['fallback_url'] = None # 置空，避免无限循环
-                        count = 0 # 重置超时计数
+                        args['fallback_url'] = None  # 置空，避免无限循环
+                        count = 0  # 重置超时计数
                         continue
                     self._write_skip_log(args)
                     self._log('<%s>文件不存在（404），已跳过！' % args['filename'])
                     return False
                 else:
+                    status_code = response.status_code
+                    response.close()
                     if count < self._try_count:
-                        self._log('<%s>下载时返回HTTP %s，第%d次重试！' % (args['filename'], response.status_code, count))
+                        self._log('<%s>下载时返回HTTP %s，第%d次重试！' % (args['filename'], status_code, count))
                     else:
-                        self._log('<%s>下载时连续返回HTTP %s，已跳过！' % (args['filename'], response.status_code))
+                        self._log('<%s>下载时连续返回HTTP %s，已跳过！' % (args['filename'], status_code))
                         return False
-            except Exception as e:  # 超时重新下载
+            except Exception:  # 超时重新下载
+                if response is not None:
+                    response.close()
+                    response = None
                 if count < self._try_count:
                     self._log('<%s>下载时，连接超时%d次，正在重试！' % (args['filename'], count))
                 else:
@@ -135,6 +147,9 @@ class DownloaderThread(ThreadDanteng):
             file_size = int(response.headers.get('Content-Length'))
         except (TypeError, ValueError):
             file_size = 0
+        finally:
+            response.close()
+
         if file_size < args['block_size'] or args['block_size'] < 0:
             download_response = self._download(args)
             if not download_response['stat']:
@@ -167,10 +182,7 @@ class DownloaderThread(ThreadDanteng):
             self._log('文件<%s>下载成功！' % args['filename'])
 
     def _download(self, args):
-        if 'headers' in args:
-            headers = args['headers']
-        else:
-            headers = {}
+        headers = args.get('headers', {})
         count = 0
         while True:
             count += 1
@@ -182,8 +194,8 @@ class DownloaderThread(ThreadDanteng):
                     if args.get('fallback_url'):
                         self._log('<%s>文件获取失败（404），更换备用URL重新尝试...' % args['filename'])
                         args['url'] = args['fallback_url']
-                        args['fallback_url'] = None # 置空
-                        count = 0 # 重置超时计数
+                        args['fallback_url'] = None  # 置空
+                        count = 0  # 重置超时计数
                         continue
                     return {'stat': False, 'msg': '404 目标不存在'}
                 else:
@@ -191,7 +203,7 @@ class DownloaderThread(ThreadDanteng):
                         self._log('<%s>下载时返回HTTP %s，第%d次重试！' % (args['filename'], response.status_code, count))
                     else:
                         return {'stat': False, 'msg': 'HTTP %s' % response.status_code}
-            except Exception as e:  # 超时重新下载
+            except Exception:  # 超时重新下载
                 if count < self._try_count:
                     self._log('<%s>下载时，连接超时%d次，正在重试！' % (args['filename'], count))
                 else:
@@ -224,13 +236,13 @@ _SIZE_UNIT = {
 
 def get_size_desc(size):
     for i in range(1, 5):
-        if size < 1024 ^ i:
+        if size < 1024:
             if size == int(size):
                 return '%d%s' % (size, _SIZE_UNIT[i])
             else:
                 return '%.2f%s' % (size, _SIZE_UNIT[i])
-        else:
-            size /= 1024
+        size /= 1024
+    return '%.2fTB' % size
 
 
 def get_start_and_end(args):
