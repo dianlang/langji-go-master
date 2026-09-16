@@ -6,6 +6,7 @@ from module_huiji.huijiWiki import HuijiWiki
 DOWNLOAD_TYPE = {
     'npc': npc,
     'skill': skill,
+    'status': status,
     'skin': skin,
     'summon': summon,
     'weapon': weapon,
