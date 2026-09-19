@@ -16,7 +16,17 @@ STATUS_INDEX_VERSION = 2
 STATUS_INDEX_PATH = os.path.join(DATA_PATH, 'status_index.json')
 STATUS_ID_MIN = 0
 STATUS_ID_MAX = 10999
-STATUS_BLOCK_SIZE = 250
+STATUS_SCAN_RANGES = [
+    (0, 999),
+    (1000, 2999),
+    (3000, 3999),
+    (4000, 4999),
+    (5000, 5999),
+    (6000, 7999),
+    (8000, 8999),
+    (9000, 9999),
+    (10000, 10999),
+]
 STATUS_INCREMENTAL_LOOKBACK = 24
 STATUS_FRONTIER_MISS_LIMIT = 25
 STATUS_DEFAULT_SCAN_WORKERS = 16
@@ -28,7 +38,7 @@ STATUS_PROBE_TIMEOUT = 10
 # 运行时不再访问 GBFAL。
 STATUS_DISCOVERY_SUFFIXES_EXTENDED = [
     '', '_1', '_2', '_10', '_11', '_101', '_110', '_111', '_20', '_30',
-    '1', '_1_1', '_2_1', '_0_10', '_1_10', '_1_20', '_2_10',
+    '1', '_01', '3', '_1_1', '_2_1', '_0_10', '_1_10', '_1_20', '_2_10',
     '1_1', '2_1', '3_1',
 ]
 STATUS_DISCOVERY_SUFFIXES_LEGACY = [
