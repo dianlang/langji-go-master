@@ -1,6 +1,7 @@
 import os
 import re
 import shutil
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlsplit, urlunsplit
 
@@ -215,6 +216,57 @@ def _new_probe_session():
     return session
 
 
+def _rank_cdn_endpoints():
+    """Probe all known GBF endpoints in parallel and put reachable/fast hosts first."""
+    test_path = '/assets/img/sp/ui/icon/status/x64/status_1.png'
+
+    def probe(endpoint):
+        start = time.monotonic()
+        response = None
+        try:
+            response = requests.head(
+                endpoint.rstrip('/') + test_path,
+                timeout=5,
+                allow_redirects=True,
+                verify=False,
+            )
+            if response.status_code == 200:
+                return endpoint, time.monotonic() - start
+        except requests.RequestException:
+            pass
+        finally:
+            if response is not None:
+                response.close()
+        return endpoint, None
+
+    results = []
+    with ThreadPoolExecutor(max_workers=len(STATUS_CDN_ENDPOINTS)) as executor:
+        futures = [executor.submit(probe, endpoint) for endpoint in STATUS_CDN_ENDPOINTS]
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception:
+                pass
+
+    reachable = sorted(
+        ((endpoint, latency) for endpoint, latency in results if latency is not None),
+        key=lambda item: item[1],
+    )
+    reachable_names = [endpoint for endpoint, _ in reachable]
+    remaining = [
+        endpoint for endpoint in STATUS_CDN_ENDPOINTS
+        if endpoint not in reachable_names
+    ]
+
+    if reachable:
+        best, latency = reachable[0]
+        log('当前最快 GBF CDN：%s（%.0fms）。' % (best, latency * 1000))
+    else:
+        log('未能在 5 秒内探测到可用 GBF CDN，将按默认顺序自动尝试备用节点。')
+
+    return reachable_names + remaining
+
+
 def _cdn_url_variants(url):
     """Yield the same asset path on alternate official GBF CDN endpoints."""
     parts = urlsplit(url)
@@ -233,11 +285,13 @@ def _cdn_url_variants(url):
         yield urlunsplit((ep.scheme, ep.netloc, parts.path, parts.query, parts.fragment))
 
 
-def _status_download_urls(filename):
+def _status_download_urls(filename, endpoints=None):
     """Build JP/EN download candidates across all official CDN endpoints."""
     urls = []
     seen = set()
-    for endpoint in STATUS_CDN_ENDPOINTS:
+    if endpoints is None:
+        endpoints = STATUS_CDN_ENDPOINTS
+    for endpoint in endpoints:
         endpoint = endpoint.rstrip('/')
         for lang in ('assets', 'assets_en'):
             url = '%s/%s/img/sp/ui/icon/status/x64/%s' % (endpoint, lang, filename)
@@ -617,6 +671,13 @@ def status(cfg):
     retry_times = _get_retry_times(cfg)
     skip_list = set(get_skip_list(include_log=False))
 
+    # VPN/代理环境下某个 Akamai 节点可能不可达。先一次性测速，
+    # 后面的扫描和批量下载都优先使用当前真正可用的节点。
+    ranked_endpoints = _rank_cdn_endpoints()
+    scan_cfg = dict(cfg)
+    if ranked_endpoints:
+        scan_cfg['base_url'] = ranked_endpoints[0].rstrip('/') + '/assets/img/sp/'
+
     # 先以内置 GBFAL 快照作为历史基线，再叠加本地后续发现。
     index = _seed_index()
     seed_ids = len(index)
@@ -638,7 +699,7 @@ def status(cfg):
         log('从 IMAGE/status/ 补充了 %d 个文件记录。' % existing_added)
 
     # GBFAL 只作为打包时的一次性历史快照；运行时只访问 GBF 官方 CDN。
-    _scan_incremental(index, cfg, retry_times, skip_list)
+    _scan_incremental(index, scan_cfg, retry_times, skip_list)
 
     downloader = Downloader()
     downloader.set_try_count(retry_times)
@@ -647,7 +708,7 @@ def status(cfg):
     queued_count = 0
     for source_filename in _iter_indexed_filenames(index):
         indexed_count += 1
-        candidate_urls = _status_download_urls(source_filename)
+        candidate_urls = _status_download_urls(source_filename, ranked_endpoints)
         candidate_urls = [url for url in candidate_urls if url not in skip_list]
         if not candidate_urls:
             continue
