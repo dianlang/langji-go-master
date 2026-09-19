@@ -2,6 +2,7 @@ import os
 import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -32,6 +33,18 @@ STATUS_FRONTIER_MISS_LIMIT = 25
 STATUS_DEFAULT_SCAN_WORKERS = 16
 STATUS_MIN_FILE_SIZE = 200
 STATUS_PROBE_TIMEOUT = 10
+
+# GBF 有多个官方 CDN 入口。部分 VPN/代理出口对某个 Akamai 域名会超时，
+# 因此状态图标探测和下载都会自动在这些入口之间切换。
+STATUS_CDN_ENDPOINTS = [
+    GBF_CDN_URL,
+    'https://prd-game-a1-granbluefantasy.akamaized.net',
+    'https://prd-game-a2-granbluefantasy.akamaized.net',
+    'https://prd-game-a3-granbluefantasy.akamaized.net',
+    'https://prd-game-a4-granbluefantasy.akamaized.net',
+    'https://prd-game-a5-granbluefantasy.akamaized.net',
+    'https://granbluefantasy.jp',
+]
 
 # 这组后缀只用于“发现一个新的状态 ID 是否存在”。
 # 其规则来自 GBFAL updater 的 search_buff；历史完整数据已经内置在 status_seed.py，
@@ -202,6 +215,39 @@ def _new_probe_session():
     return session
 
 
+def _cdn_url_variants(url):
+    """Yield the same asset path on alternate official GBF CDN endpoints."""
+    parts = urlsplit(url)
+    seen = set()
+
+    # Always try the caller-provided URL first, including custom base_url values.
+    seen.add((parts.scheme, parts.netloc))
+    yield url
+
+    for endpoint in STATUS_CDN_ENDPOINTS:
+        ep = urlsplit(endpoint)
+        key = (ep.scheme, ep.netloc)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield urlunsplit((ep.scheme, ep.netloc, parts.path, parts.query, parts.fragment))
+
+
+def _status_download_urls(filename):
+    """Build JP/EN download candidates across all official CDN endpoints."""
+    urls = []
+    seen = set()
+    for endpoint in STATUS_CDN_ENDPOINTS:
+        endpoint = endpoint.rstrip('/')
+        for lang in ('assets', 'assets_en'):
+            url = '%s/%s/img/sp/ui/icon/status/x64/%s' % (endpoint, lang, filename)
+            if url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
 def _response_size(response):
     try:
         return int(response.headers.get('Content-Length', 0))
@@ -213,45 +259,53 @@ def _probe_url(session, url, retry_times):
     """True=real icon, False=confirmed missing/placeholder, None=network uncertainty."""
     attempts = min(max(1, retry_times), 2)
 
-    for _ in range(attempts):
-        response = None
-        try:
-            response = session.head(
-                url,
-                timeout=STATUS_PROBE_TIMEOUT,
-                allow_redirects=True,
-                verify=False,
-            )
-            if response.status_code == 404:
-                return False
-            if response.status_code == 200:
-                size = _response_size(response)
-                if size > 0:
-                    return size >= STATUS_MIN_FILE_SIZE
-
-                response.close()
-                response = session.get(
-                    url,
-                    headers={'Range': 'bytes=0-%d' % (STATUS_MIN_FILE_SIZE - 1)},
+    # A network failure on one CDN host should not make the ID uncertain if
+    # another official host is reachable. A confirmed 404 remains authoritative
+    # so missing IDs do not fan out into many unnecessary requests.
+    for candidate_url in _cdn_url_variants(url):
+        for _ in range(attempts):
+            response = None
+            try:
+                response = session.head(
+                    candidate_url,
                     timeout=STATUS_PROBE_TIMEOUT,
-                    stream=True,
+                    allow_redirects=True,
                     verify=False,
                 )
                 if response.status_code == 404:
                     return False
-                if response.status_code not in (200, 206):
-                    continue
+                if response.status_code == 200:
+                    size = _response_size(response)
+                    if size > 0:
+                        return size >= STATUS_MIN_FILE_SIZE
 
-                size = _response_size(response)
-                if size > 0 and response.status_code == 200 and size < STATUS_MIN_FILE_SIZE:
-                    return False
-                content = next(response.iter_content(chunk_size=STATUS_MIN_FILE_SIZE), b'')
-                return len(content) >= STATUS_MIN_FILE_SIZE
-        except requests.RequestException:
-            pass
-        finally:
-            if response is not None:
-                response.close()
+                    response.close()
+                    response = session.get(
+                        candidate_url,
+                        headers={'Range': 'bytes=0-%d' % (STATUS_MIN_FILE_SIZE - 1)},
+                        timeout=STATUS_PROBE_TIMEOUT,
+                        stream=True,
+                        verify=False,
+                    )
+                    if response.status_code == 404:
+                        return False
+                    if response.status_code not in (200, 206):
+                        break
+
+                    size = _response_size(response)
+                    if size > 0 and response.status_code == 200 and size < STATUS_MIN_FILE_SIZE:
+                        return False
+                    content = next(response.iter_content(chunk_size=STATUS_MIN_FILE_SIZE), b'')
+                    return len(content) >= STATUS_MIN_FILE_SIZE
+
+                # 429/5xx 等先换下一个官方 CDN，避免在 VPN 的坏线路上反复等待。
+                break
+            except requests.RequestException:
+                # 同一节点最多按 retry 配置重试两次，然后自动换节点。
+                pass
+            finally:
+                if response is not None:
+                    response.close()
 
     return None
 
@@ -589,18 +643,16 @@ def status(cfg):
     downloader = Downloader()
     downloader.set_try_count(retry_times)
 
-    primary_base_url = cfg['base_url'] + 'ui/icon/status/x64/'
-    english_base_url = f'{GBF_CDN_URL}/assets_en/img/sp/ui/icon/status/x64/'
-
     indexed_count = 0
     queued_count = 0
     for source_filename in _iter_indexed_filenames(index):
         indexed_count += 1
-        source_url = primary_base_url + source_filename
-        fallback_url = english_base_url + source_filename
-
-        if source_url in skip_list or fallback_url in skip_list:
+        candidate_urls = _status_download_urls(source_filename)
+        candidate_urls = [url for url in candidate_urls if url not in skip_list]
+        if not candidate_urls:
             continue
+        source_url = candidate_urls[0]
+        fallback_urls = candidate_urls[1:]
 
         save_path = os.path.join(IMAGE_PATH, IMAGE_STATUS_PATH, source_filename)
         save_new_path = os.path.join(IMAGE_PATH, IMAGE_NEW_PATH, source_filename)
@@ -618,7 +670,7 @@ def status(cfg):
         downloader.download_multi_copies(
             source_url,
             save_list,
-            fallback_url=fallback_url,
+            fallback_urls=fallback_urls,
             write_skip_log=False,
         )
         queued_count += 1
