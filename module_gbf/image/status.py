@@ -1,36 +1,38 @@
 import os
 import re
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
 from module_huiji.danteng_downloader import Downloader
 from module_huiji.danteng_lib import load_json, log, save_json
 from ..util import get_skip_list
+from .status_seed import STATUS_SEED
 from config import DATA_PATH, GBF_CDN_URL, IMAGE_PATH, IMAGE_NEW_PATH, IMAGE_STATUS_PATH
 
 
-STATUS_INDEX_VERSION = 1
+STATUS_INDEX_VERSION = 2
 STATUS_INDEX_PATH = os.path.join(DATA_PATH, 'status_index.json')
 STATUS_ID_MIN = 0
-STATUS_ID_MAX = 9999
+STATUS_ID_MAX = 10999
 STATUS_BLOCK_SIZE = 250
-STATUS_BOOTSTRAP_MISS_LIMIT = 50
-STATUS_INCREMENTAL_MISS_LIMIT = 25
-STATUS_INCREMENTAL_LOOKBACK = 20
-STATUS_RECENT_RECHECK_COUNT = 5
+STATUS_INCREMENTAL_LOOKBACK = 24
+STATUS_FRONTIER_MISS_LIMIT = 25
+STATUS_DEFAULT_SCAN_WORKERS = 16
 STATUS_MIN_FILE_SIZE = 200
 STATUS_PROBE_TIMEOUT = 10
 
-# GBF 的状态图标除无后缀版本外，还存在多种历史/特殊后缀。
-# 这些是目前游戏资源中已知的命名形式。这里仅保留命名规律，运行时不再读取 GBFAL。
-STATUS_SUFFIXES_EXTENDED = [
+# 这组后缀只用于“发现一个新的状态 ID 是否存在”。
+# 其规则来自 GBFAL updater 的 search_buff；历史完整数据已经内置在 status_seed.py，
+# 运行时不再访问 GBFAL。
+STATUS_DISCOVERY_SUFFIXES_EXTENDED = [
     '', '_1', '_2', '_10', '_11', '_101', '_110', '_111', '_20', '_30',
     '1', '_1_1', '_2_1', '_0_10', '_1_10', '_1_20', '_2_10',
     '1_1', '2_1', '3_1',
 ]
-STATUS_SUFFIXES_LEGACY = [
-    suffix for suffix in STATUS_SUFFIXES_EXTENDED
+STATUS_DISCOVERY_SUFFIXES_LEGACY = [
+    suffix for suffix in STATUS_DISCOVERY_SUFFIXES_EXTENDED
     if suffix not in {'1', '1_1', '2_1', '3_1'}
 ]
 
@@ -45,28 +47,61 @@ def _get_retry_times(cfg):
     return max(1, retry_times)
 
 
-def _suffixes_for_id(status_id):
-    if status_id >= 1000:
-        return STATUS_SUFFIXES_EXTENDED
-    return STATUS_SUFFIXES_LEGACY
+def _get_scan_workers(cfg):
+    workers = STATUS_DEFAULT_SCAN_WORKERS
+    if 'IMAGE' in cfg and 'status_threads' in cfg['IMAGE']:
+        try:
+            workers = int(cfg['IMAGE']['status_threads'])
+        except (TypeError, ValueError):
+            pass
+    return min(32, max(2, workers))
 
 
-def _sort_suffixes(status_id, suffixes):
-    order = {suffix: i for i, suffix in enumerate(_suffixes_for_id(status_id))}
-    return sorted(set(suffixes), key=lambda suffix: (order.get(suffix, 999), suffix))
+def _suffix_sort_key(suffix):
+    if suffix == '':
+        return (0,)
+    parts = re.split(r'(\d+)', suffix)
+    key = [1]
+    for part in parts:
+        if part == '':
+            continue
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part))
+    return tuple(key)
 
 
-def _load_status_index():
+def _normalize_suffixes(suffixes):
+    result = []
+    seen = set()
+    for suffix in suffixes:
+        suffix = str(suffix)
+        if suffix in seen:
+            continue
+        seen.add(suffix)
+        result.append(suffix)
+    result.sort(key=_suffix_sort_key)
+    return result
+
+
+def _seed_index():
+    return {
+        str(status_id): _normalize_suffixes(suffixes)
+        for status_id, suffixes in STATUS_SEED.items()
+    }
+
+
+def _load_local_index():
     try:
         data = load_json(STATUS_INDEX_PATH)
     except Exception as exc:
-        log('读取状态图标索引失败，将重新建立：%s' % exc)
+        log('读取本地状态图标索引失败，将使用内置历史索引：%s' % exc)
         return {}
 
     if not isinstance(data, dict):
         return {}
 
-    # v1 使用 {"version": 1, "icons": {...}}；同时兼容早期直接保存的 ID -> suffixes 结构。
     icons = data.get('icons') if isinstance(data.get('icons'), dict) else data
     result = {}
     for raw_id, raw_suffixes in icons.items():
@@ -75,66 +110,86 @@ def _load_status_index():
         status_id = int(raw_id)
         if status_id < STATUS_ID_MIN or status_id > STATUS_ID_MAX:
             continue
-        valid_suffixes = [
-            str(suffix) for suffix in raw_suffixes
-            if str(suffix) in _suffixes_for_id(status_id)
-        ]
-        if valid_suffixes:
-            result[str(status_id)] = _sort_suffixes(status_id, valid_suffixes)
+        suffixes = _normalize_suffixes(raw_suffixes)
+        if suffixes:
+            result[str(status_id)] = suffixes
     return result
+
+
+def _merge_index(target, source):
+    added_ids = 0
+    added_files = 0
+    for raw_id, suffixes in source.items():
+        key = str(int(raw_id))
+        before = set(target.get(key, []))
+        after = before | set(str(suffix) for suffix in suffixes)
+        if key not in target:
+            added_ids += 1
+        added_files += len(after - before)
+        target[key] = _normalize_suffixes(after)
+    return added_ids, added_files
 
 
 def _save_status_index(index):
     ordered = {}
     for key in sorted(index.keys(), key=lambda value: int(value)):
-        status_id = int(key)
-        suffixes = _sort_suffixes(status_id, index[key])
+        suffixes = _normalize_suffixes(index[key])
         if suffixes:
-            ordered[str(status_id)] = suffixes
+            ordered[str(int(key))] = suffixes
     save_json({
         'version': STATUS_INDEX_VERSION,
         'icons': ordered,
     }, STATUS_INDEX_PATH, indent=2)
 
 
-def _parse_status_filename(filename):
-    match = re.match(r'^status_(.+)\.png$', filename, flags=re.IGNORECASE)
-    if match is None:
-        return None
-
-    stem = match.group(1)
-    # ID 当前为 0~9999。个别后缀没有下划线，因此必须从最多 4 位 ID 开始尝试拆分。
-    for width in range(min(4, len(stem)), 0, -1):
-        id_part = stem[:width]
-        suffix = stem[width:]
-        if not id_part.isdigit():
-            continue
-        status_id = int(id_part)
-        if status_id < STATUS_ID_MIN or status_id > STATUS_ID_MAX:
-            continue
-        if suffix in _suffixes_for_id(status_id):
-            return status_id, suffix
-    return None
+def _count_index_files(index):
+    return sum(len(suffixes) for suffixes in index.values())
 
 
 def _merge_existing_files(index):
+    """Use already-downloaded files to supplement known IDs without guessing historical data."""
     status_dir = os.path.join(IMAGE_PATH, IMAGE_STATUS_PATH)
     if not os.path.isdir(status_dir):
         return 0
 
     added = 0
+    known_ids = set(index.keys())
     for filename in os.listdir(status_dir):
-        parsed = _parse_status_filename(filename)
+        match = re.match(r'^status_(.+)\.png$', filename, flags=re.IGNORECASE)
+        if match is None:
+            continue
+        stem = match.group(1)
+
+        # Prefer the longest ID that is already known in the bundled/local index.
+        parsed = None
+        for width in range(min(5, len(stem)), 0, -1):
+            id_part = stem[:width]
+            if not id_part.isdigit():
+                continue
+            key = str(int(id_part))
+            if key in known_ids:
+                parsed = (key, stem[width:])
+                break
         if parsed is None:
             continue
-        status_id, suffix = parsed
-        key = str(status_id)
+
+        key, suffix = parsed
         known = set(index.get(key, []))
         if suffix not in known:
             known.add(suffix)
-            index[key] = _sort_suffixes(status_id, known)
+            index[key] = _normalize_suffixes(known)
             added += 1
     return added
+
+
+def _new_probe_session():
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) VajraGo/1.0',
+        'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+        'Connection': 'keep-alive',
+    })
+    return session
 
 
 def _response_size(response):
@@ -145,9 +200,8 @@ def _response_size(response):
 
 
 def _probe_url(session, url, retry_times):
-    """Return True if a real icon exists, False for a confirmed miss, None for network uncertainty."""
+    """True=real icon, False=confirmed missing/placeholder, None=network uncertainty."""
     attempts = min(max(1, retry_times), 2)
-    last_state = None
 
     for _ in range(attempts):
         response = None
@@ -158,15 +212,13 @@ def _probe_url(session, url, retry_times):
                 allow_redirects=True,
                 verify=False,
             )
-            status_code = response.status_code
-            if status_code == 404:
+            if response.status_code == 404:
                 return False
-            if status_code == 200:
+            if response.status_code == 200:
                 size = _response_size(response)
                 if size > 0:
                     return size >= STATUS_MIN_FILE_SIZE
 
-                # 极少数环境下 HEAD 不返回长度；只读取前 200 字节确认不是空白占位文件。
                 response.close()
                 response = session.get(
                     url,
@@ -175,40 +227,45 @@ def _probe_url(session, url, retry_times):
                     stream=True,
                     verify=False,
                 )
+                if response.status_code == 404:
+                    return False
                 if response.status_code not in (200, 206):
-                    if response.status_code == 404:
-                        return False
-                    last_state = None
                     continue
+
                 size = _response_size(response)
                 if size > 0 and response.status_code == 200 and size < STATUS_MIN_FILE_SIZE:
                     return False
                 content = next(response.iter_content(chunk_size=STATUS_MIN_FILE_SIZE), b'')
                 return len(content) >= STATUS_MIN_FILE_SIZE
-
-            # 5xx/限流等不当成“文件不存在”，避免因为临时网络问题漏掉 ID。
-            last_state = None
         except requests.RequestException:
-            last_state = None
+            pass
         finally:
             if response is not None:
                 response.close()
 
-    return last_state
+    return None
 
 
-def _probe_status_filename(session, base_url, filename, retry_times, skip_list):
+def _probe_suffix(session, base_url, status_id, suffix, retry_times, skip_list):
+    filename = 'status_%s%s.png' % (status_id, suffix)
     url = base_url + filename
     if url in skip_list:
         return False
     return _probe_url(session, url, retry_times)
 
 
+def _discovery_suffixes(status_id):
+    if status_id >= 1000:
+        return STATUS_DISCOVERY_SUFFIXES_EXTENDED
+    return STATUS_DISCOVERY_SUFFIXES_LEGACY
+
+
 def _find_first_variant(session, base_url, status_id, retry_times, skip_list):
     uncertain = False
-    for suffix in _suffixes_for_id(status_id):
-        filename = 'status_%s%s.png' % (status_id, suffix)
-        exists = _probe_status_filename(session, base_url, filename, retry_times, skip_list)
+    for suffix in _discovery_suffixes(status_id):
+        exists = _probe_suffix(
+            session, base_url, status_id, suffix, retry_times, skip_list
+        )
         if exists is True:
             return suffix, uncertain
         if exists is None:
@@ -216,156 +273,280 @@ def _find_first_variant(session, base_url, status_id, retry_times, skip_list):
     return None, uncertain
 
 
-def _discover_missing_variants(session, base_url, status_id, known_suffixes, retry_times, skip_list):
-    known = set(known_suffixes)
-    added = 0
+def _scan_variant_mode(mode, base_url, status_id, known_suffixes, retry_times, skip_list):
+    """Probe one variation family. The stopping rules mirror GBFAL's updater logic."""
+    found = set()
     uncertain = False
+    known = set(known_suffixes)
+    session = _new_probe_session()
 
-    for suffix in _suffixes_for_id(status_id):
-        if suffix in known:
-            continue
-        filename = 'status_%s%s.png' % (status_id, suffix)
-        exists = _probe_status_filename(session, base_url, filename, retry_times, skip_list)
+    def check(suffix):
+        nonlocal uncertain
+        if suffix in known or suffix in found:
+            return True
+        exists = _probe_suffix(
+            session, base_url, status_id, suffix, retry_times, skip_list
+        )
         if exists is True:
-            known.add(suffix)
-            added += 1
-        elif exists is None:
+            found.add(suffix)
+            return True
+        if exists is None:
             uncertain = True
-
-    return _sort_suffixes(status_id, known), added, uncertain
-
-
-def _scan_status_index(index, cfg, retry_times, skip_list, bootstrap=False):
-    """Discover status IDs directly from the official GBF CDN and update the local index."""
-    base_url = cfg['base_url'] + 'ui/icon/status/x64/'
-    new_ids = 0
-    new_variants = 0
-    had_network_error = False
-
-    if bootstrap:
-        log('未找到本地状态图标索引，将直接扫描 GBF 官方 CDN；首次运行可能需要较长时间。')
-    else:
-        log('已读取本地状态图标索引：%d 个状态 ID。' % len(index))
-
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) VajraGo/1.0',
-        'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-        'Connection': 'keep-alive',
-    })
-    requests.packages.urllib3.disable_warnings()
+        return False
 
     try:
-        for block_start in range(STATUS_ID_MIN, STATUS_ID_MAX + 1, STATUS_BLOCK_SIZE):
-            block_end = min(block_start + STATUS_BLOCK_SIZE - 1, STATUS_ID_MAX)
-            known_ids = sorted(
-                int(key) for key in index.keys()
-                if key.isdigit() and block_start <= int(key) <= block_end
-            )
-            last_known = known_ids[-1] if known_ids else block_start - 1
-            miss_limit = STATUS_BOOTSTRAP_MISS_LIMIT if (bootstrap or not known_ids) else STATUS_INCREMENTAL_MISS_LIMIT
+        if mode == 0:
+            check('')
 
-            if bootstrap or not known_ids:
-                scan_start = block_start
-            else:
-                scan_start = max(block_start, last_known - STATUS_INCREMENTAL_LOOKBACK)
+        elif mode == 1:
+            err = 0
+            n = 0
+            while err < 3 and n < 10:
+                suffix = '_' + str(n)
+                if check(suffix):
+                    err = 0
+                else:
+                    err += 1
+                n += 1
 
-            consecutive_misses = 0
-            consecutive_errors = 0
-            block_changed = False
+        elif mode == 2:
+            if status_id < 1000:
+                return found, uncertain
+            err = 0
+            n = 0
+            while err < 5 and n < 100:
+                suffix = str(n)
+                if check(suffix):
+                    err = 0
+                else:
+                    err += 1
+                n += 1
 
-            for status_id in range(scan_start, block_end + 1):
-                key = str(status_id)
-                if key in index:
-                    consecutive_misses = 0
-                    consecutive_errors = 0
-                    continue
+        elif mode == 3:
+            err_limit = 10 if status_id in (3000, 1008) else 4
+            for x in range(1, 10):
+                n = 10 * x
+                end = n + 10
+                err = 0
+                while err < err_limit and n < end:
+                    suffix = '_' + str(n)
+                    if check(suffix):
+                        err = 0
+                    else:
+                        err += 1
+                    n += 1
 
-                first_suffix, uncertain = _find_first_variant(
-                    session, base_url, status_id, retry_times, skip_list
-                )
-                if first_suffix is not None:
-                    suffixes, extra_added, extra_uncertain = _discover_missing_variants(
-                        session,
-                        base_url,
-                        status_id,
-                        [first_suffix],
-                        retry_times,
-                        skip_list,
-                    )
-                    index[key] = suffixes
-                    new_ids += 1
-                    new_variants += 1 + extra_added
-                    block_changed = True
-                    consecutive_misses = 0
-                    consecutive_errors = 0
-                    had_network_error = had_network_error or extra_uncertain
-                    log('发现状态图标 ID %d，共 %d 个文件变体。' % (status_id, len(suffixes)))
-                    continue
+        elif mode == 4:
+            for x in range(1, 8):
+                n = 0
+                err = 0
+                while err < 3 and n < 100:
+                    suffix = '_' + str(x) + str(n).zfill(2)
+                    if check(suffix):
+                        err = 0
+                    else:
+                        err += 1
+                        if err == 3 and n < 10:
+                            n = 9
+                            err = 0
+                    n += 1
+            check('_110')
 
-                if uncertain:
-                    had_network_error = True
-                    consecutive_errors += 1
-                    # 连续多个 ID 都无法确定时更可能是网络/CDN异常，停止当前分段，避免误判和长时间卡住。
-                    if consecutive_errors >= 3:
-                        log('状态图标扫描在 ID %d 附近连续遇到网络异常，暂时停止当前分段。' % status_id)
-                        break
-                    continue
+        elif mode == 5:
+            base_limit = 22 if status_id in (6579, 6967) else 10
+            err_limit = 6 if status_id == 1019 else 4
+            for x in range(base_limit):
+                n = 0
+                err = 0
+                while err < err_limit and n < 200:
+                    suffix = '_' + str(x) + '_' + str(n)
+                    if check(suffix):
+                        err = 0
+                    else:
+                        err += 1
+                    n += 1
 
-                consecutive_errors = 0
-                consecutive_misses += 1
-                # 已有索引时必须至少扫描到该分段当前最高已知 ID；之后连续 miss 达阈值即可停止。
-                if status_id > last_known and consecutive_misses >= miss_limit:
-                    break
-
-            # 已有索引时，额外复查每个 250 ID 分段中较新的若干 ID，捕获后来新增的特殊后缀。
-            current_known_ids = sorted(
-                int(key) for key in index.keys()
-                if key.isdigit() and block_start <= int(key) <= block_end
-            )
-            if not bootstrap and current_known_ids:
-                for status_id in current_known_ids[-STATUS_RECENT_RECHECK_COUNT:]:
-                    key = str(status_id)
-                    suffixes, added, uncertain = _discover_missing_variants(
-                        session,
-                        base_url,
-                        status_id,
-                        index[key],
-                        retry_times,
-                        skip_list,
-                    )
-                    if added > 0:
-                        index[key] = suffixes
-                        new_variants += added
-                        block_changed = True
-                        log('状态图标 ID %d 新发现 %d 个文件变体。' % (status_id, added))
-                    had_network_error = had_network_error or uncertain
-
-            # 首次扫描可能持续较久，分段保存，意外中断后下次可以从本地索引继续。
-            if block_changed or bootstrap:
-                _save_status_index(index)
+        elif mode == 6:
+            if status_id < 1000:
+                return found, uncertain
+            for x in range(10):
+                n = 0
+                err = 0
+                while err < 4 and n < 100:
+                    suffix = str(x) + '_' + str(n)
+                    if check(suffix):
+                        err = 0
+                    else:
+                        err += 1
+                    n += 1
     finally:
         session.close()
 
+    return found, uncertain
+
+
+def _discover_all_variants(base_url, status_id, initial_suffixes, retry_times, skip_list):
+    known = set(initial_suffixes)
+    uncertain = False
+
+    with ThreadPoolExecutor(max_workers=7) as executor:
+        futures = [
+            executor.submit(
+                _scan_variant_mode,
+                mode,
+                base_url,
+                status_id,
+                known,
+                retry_times,
+                skip_list,
+            )
+            for mode in range(7)
+        ]
+        for future in as_completed(futures):
+            try:
+                found, mode_uncertain = future.result()
+                known.update(found)
+                uncertain = uncertain or mode_uncertain
+            except Exception:
+                uncertain = True
+
+    return _normalize_suffixes(known), uncertain
+
+
+def _scan_block(block_start, block_end, index, base_url, retry_times, skip_list):
+    """Scan only the frontier/lookback of one 250-ID block."""
+    known_ids = sorted(
+        int(key) for key in index.keys()
+        if key.isdigit() and block_start <= int(key) <= block_end
+    )
+    last_known = known_ids[-1] if known_ids else block_start - 1
+
+    if known_ids:
+        scan_start = max(block_start, last_known - STATUS_INCREMENTAL_LOOKBACK)
+    else:
+        scan_start = block_start
+
+    discoveries = {}
+    had_network_error = False
+    consecutive_misses = 0
+    consecutive_errors = 0
+    frontier = last_known
+    session = _new_probe_session()
+
+    try:
+        for status_id in range(scan_start, block_end + 1):
+            key = str(status_id)
+            if key in index or key in discoveries:
+                consecutive_misses = 0
+                consecutive_errors = 0
+                continue
+
+            first_suffix, uncertain = _find_first_variant(
+                session, base_url, status_id, retry_times, skip_list
+            )
+            if first_suffix is not None:
+                suffixes, variant_uncertain = _discover_all_variants(
+                    base_url,
+                    status_id,
+                    [first_suffix],
+                    retry_times,
+                    skip_list,
+                )
+                discoveries[key] = suffixes
+                frontier = max(frontier, status_id)
+                consecutive_misses = 0
+                consecutive_errors = 0
+                had_network_error = had_network_error or variant_uncertain
+                continue
+
+            if uncertain:
+                had_network_error = True
+                consecutive_errors += 1
+                if consecutive_errors >= 3:
+                    break
+                continue
+
+            consecutive_errors = 0
+            consecutive_misses += 1
+
+            # Lookback 区间不能提前终止；越过原有最高 ID 后才按连续 miss 收敛。
+            if status_id > last_known and consecutive_misses >= STATUS_FRONTIER_MISS_LIMIT:
+                break
+    finally:
+        session.close()
+
+    return block_start, discoveries, had_network_error, frontier
+
+
+def _scan_incremental(index, cfg, retry_times, skip_list):
+    base_url = cfg['base_url'] + 'ui/icon/status/x64/'
+    workers = _get_scan_workers(cfg)
+    requests.packages.urllib3.disable_warnings()
+
+    blocks = []
+    for block_start in range(STATUS_ID_MIN, STATUS_ID_MAX + 1, STATUS_BLOCK_SIZE):
+        block_end = min(block_start + STATUS_BLOCK_SIZE - 1, STATUS_ID_MAX)
+        blocks.append((block_start, block_end))
+
+    log('开始增量扫描 GBF 官方 CDN：%d 个分段，%d 线程。' % (len(blocks), workers))
+
+    new_ids = 0
+    new_files = 0
+    had_network_error = False
+    snapshot = {
+        key: list(value)
+        for key, value in index.items()
+    }
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(
+                _scan_block,
+                block_start,
+                block_end,
+                snapshot,
+                base_url,
+                retry_times,
+                skip_list,
+            )
+            for block_start, block_end in blocks
+        ]
+
+        for future in as_completed(futures):
+            try:
+                _, discoveries, network_error, _ = future.result()
+            except Exception as exc:
+                had_network_error = True
+                log('状态图标分段扫描异常：%s' % exc)
+                continue
+
+            had_network_error = had_network_error or network_error
+            for key in sorted(discoveries.keys(), key=lambda value: int(value)):
+                suffixes = discoveries[key]
+                before = set(index.get(key, []))
+                after = before | set(suffixes)
+                if key not in index:
+                    new_ids += 1
+                    log('发现新的状态图标 ID %s，共 %d 个文件变体。' % (key, len(after)))
+                new_files += len(after - before)
+                index[key] = _normalize_suffixes(after)
+
     _save_status_index(index)
-    if not index:
-        log('未能从 GBF 官方 CDN 建立状态图标索引，请检查网络连接后重试。')
-        return False
-    log('状态图标索引更新完成：新增 %d 个 ID、%d 个文件变体。' % (new_ids, new_variants))
+    log('状态图标增量扫描完成：新增 %d 个 ID、%d 个文件。' % (new_ids, new_files))
     if had_network_error:
-        log('扫描期间有部分请求遇到网络异常；已发现的数据已保存，下次运行会继续检查。')
+        log('扫描期间部分请求遇到网络异常；已发现的数据已保存，下次运行会继续检查。')
     return True
 
 
 def _iter_indexed_filenames(index):
     for key in sorted(index.keys(), key=lambda value: int(value)):
         status_id = int(key)
-        for suffix in _sort_suffixes(status_id, index[key]):
+        for suffix in _normalize_suffixes(index[key]):
             yield 'status_%s%s.png' % (status_id, suffix)
 
 
 def status(cfg):
-    """Discover and download battle status/buff icons without external indexes."""
+    """Download battle status/buff icons using a bundled historical snapshot plus CDN discovery."""
     save_to_new = False
     if 'IMAGE' in cfg and cfg['IMAGE'].get('new', '').lower() == 'yes':
         save_to_new = True
@@ -373,15 +554,28 @@ def status(cfg):
     retry_times = _get_retry_times(cfg)
     skip_list = set(get_skip_list(include_log=False))
 
-    index = _load_status_index()
-    bootstrap = len(index) == 0
-    imported = _merge_existing_files(index)
-    if imported > 0:
-        log('从 IMAGE/status/ 补充了 %d 条本地状态图标索引记录。' % imported)
-        _save_status_index(index)
+    # 先以内置 GBFAL 快照作为历史基线，再叠加本地后续发现。
+    index = _seed_index()
+    seed_ids = len(index)
+    seed_files = _count_index_files(index)
 
-    if not _scan_status_index(index, cfg, retry_times, skip_list, bootstrap=bootstrap):
-        return False
+    local_index = _load_local_index()
+    _, local_added_files = _merge_index(index, local_index)
+
+    existing_added = _merge_existing_files(index)
+    _save_status_index(index)
+
+    log(
+        '已载入内置状态图标历史索引：%d 个 ID、%d 个文件（GBFAL 快照 2026-09-19）。'
+        % (seed_ids, seed_files)
+    )
+    if local_added_files > 0:
+        log('从本地状态索引合并了 %d 个后续发现文件。' % local_added_files)
+    if existing_added > 0:
+        log('从 IMAGE/status/ 补充了 %d 个文件记录。' % existing_added)
+
+    # GBFAL 只作为打包时的一次性历史快照；运行时只访问 GBF 官方 CDN。
+    _scan_incremental(index, cfg, retry_times, skip_list)
 
     downloader = Downloader()
     downloader.set_try_count(retry_times)
@@ -420,6 +614,6 @@ def status(cfg):
         )
         queued_count += 1
 
-    log('本地状态图标索引共 %d 个文件，本次需要下载 %d 个。' % (indexed_count, queued_count))
+    log('状态图标索引共 %d 个文件，本次需要下载 %d 个。' % (indexed_count, queued_count))
     downloader.wait_threads()
     return True
