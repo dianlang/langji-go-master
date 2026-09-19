@@ -483,10 +483,9 @@ def _scan_incremental(index, cfg, retry_times, skip_list):
     workers = _get_scan_workers(cfg)
     requests.packages.urllib3.disable_warnings()
 
-    blocks = []
-    for block_start in range(STATUS_ID_MIN, STATUS_ID_MAX + 1, STATUS_BLOCK_SIZE):
-        block_end = min(block_start + STATUS_BLOCK_SIZE - 1, STATUS_ID_MAX)
-        blocks.append((block_start, block_end))
+    # 状态 ID 本身按用途分成几个大区段。历史数据已经由内置快照覆盖，
+    # 日常只扫描每个区段的最新前沿和少量回看范围，不再逐个扫完整 0~9999。
+    blocks = list(STATUS_SCAN_RANGES)
 
     log('开始增量扫描 GBF 官方 CDN：%d 个分段，%d 线程。' % (len(blocks), workers))
 
