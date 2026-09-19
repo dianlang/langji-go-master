@@ -23,39 +23,24 @@ class Downloader(ObjectDanteng):
         self._block_size = size
 
     # 尝试下载
-    def download(self, url, path, filename, headers=None, log_handle=None, fallback_url=None, fallback_urls=None, write_skip_log=True):
+    def download(self, url, path, filename, headers=None, log_handle=None, fallback_url=None, write_skip_log=True):
         return self.download_multi_copies(
             url,
             [os.path.join(path, filename)],
             headers=headers,
             log_handle=log_handle,
             fallback_url=fallback_url,
-            fallback_urls=fallback_urls,
             write_skip_log=write_skip_log,
         )
 
     # 多保存目标下载
-    def download_multi_copies(self, url, save_list, headers=None, log_handle=None, fallback_url=None, fallback_urls=None, write_skip_log=True):
+    def download_multi_copies(self, url, save_list, headers=None, log_handle=None, fallback_url=None, write_skip_log=True):
         if len(save_list) == 0:
             return False
         filename = os.path.split(save_list[0])[1]
-        url_fallbacks = []
-        if fallback_url:
-            url_fallbacks.append(fallback_url)
-        if fallback_urls:
-            if isinstance(fallback_urls, (list, tuple)):
-                url_fallbacks.extend(fallback_urls)
-            else:
-                url_fallbacks.append(fallback_urls)
-        # 去重并避免把当前 URL 再塞回备用列表。
-        url_fallbacks = [
-            item for item in dict.fromkeys(url_fallbacks)
-            if item and item != url
-        ]
-
         args = {
             'url': url,
-            'fallback_urls': url_fallbacks,
+            'fallback_url': fallback_url,
             'filename': filename,
             'save_list': save_list,
             'block_size': self._block_size,
@@ -101,17 +86,6 @@ class DownloaderThread(ThreadDanteng):
         else:
             self._segment_download(args)
 
-    def _switch_to_fallback(self, args, reason):
-        fallbacks = args.get('fallback_urls') or []
-        while fallbacks:
-            next_url = fallbacks.pop(0)
-            if not next_url or next_url == args.get('url'):
-                continue
-            args['url'] = next_url
-            self._log('<%s>%s，切换备用URL...' % (args['filename'], reason))
-            return True
-        return False
-
     def _write_skip_log(self, args):
         if not args.get('write_skip_log', True):
             return
@@ -142,8 +116,11 @@ class DownloaderThread(ThreadDanteng):
                     break
                 elif response.status_code == 404:
                     response.close()
-                    if self._switch_to_fallback(args, '文件获取失败（404）'):
-                        count = 0
+                    if args.get('fallback_url'):
+                        self._log('<%s>文件获取失败（404），更换备用URL重新尝试...' % args['filename'])
+                        args['url'] = args['fallback_url']
+                        args['fallback_url'] = None  # 置空，避免无限循环
+                        count = 0  # 重置超时计数
                         continue
                     self._write_skip_log(args)
                     self._log('<%s>文件不存在（404），已跳过！' % args['filename'])
@@ -151,21 +128,15 @@ class DownloaderThread(ThreadDanteng):
                 else:
                     status_code = response.status_code
                     response.close()
-                    if self._switch_to_fallback(args, '返回HTTP %s' % status_code):
-                        count = 0
-                        continue
                     if count < self._try_count:
                         self._log('<%s>下载时返回HTTP %s，第%d次重试！' % (args['filename'], status_code, count))
                     else:
                         self._log('<%s>下载时连续返回HTTP %s，已跳过！' % (args['filename'], status_code))
                         return False
-            except Exception:  # 超时/连接错误
+            except Exception:  # 超时重新下载
                 if response is not None:
                     response.close()
                     response = None
-                if self._switch_to_fallback(args, '连接失败'):
-                    count = 0
-                    continue
                 if count < self._try_count:
                     self._log('<%s>下载时，连接超时%d次，正在重试！' % (args['filename'], count))
                 else:
@@ -247,25 +218,19 @@ class DownloaderThread(ThreadDanteng):
                     break
 
                 if response.status_code == 404:
-                    response.close()
-                    if self._switch_to_fallback(args, '文件获取失败（404）'):
-                        count = 0
+                    if args.get('fallback_url'):
+                        self._log('<%s>文件获取失败（404），更换备用URL重新尝试...' % args['filename'])
+                        args['url'] = args['fallback_url']
+                        args['fallback_url'] = None  # 置空
+                        count = 0  # 重置超时计数
                         continue
                     return {'stat': False, 'msg': '404 目标不存在'}
 
-                status_code = response.status_code
-                response.close()
-                if self._switch_to_fallback(args, '返回HTTP %s' % status_code):
-                    count = 0
-                    continue
                 if count < self._try_count:
-                    self._log('<%s>下载时返回HTTP %s，第%d次重试！' % (args['filename'], status_code, count))
+                    self._log('<%s>下载时返回HTTP %s，第%d次重试！' % (args['filename'], response.status_code, count))
                 else:
-                    return {'stat': False, 'msg': 'HTTP %s' % status_code}
-            except Exception:  # 超时/连接错误
-                if self._switch_to_fallback(args, '连接失败'):
-                    count = 0
-                    continue
+                    return {'stat': False, 'msg': 'HTTP %s' % response.status_code}
+            except Exception:  # 超时重新下载
                 if count < self._try_count:
                     self._log('<%s>下载时，连接超时%d次，正在重试！' % (args['filename'], count))
                 else:
