@@ -38,7 +38,14 @@ python vajra_go.py image skill
 python vajra_go.py image status
 ```
 
-`status` 会读取 [GBFAL](https://github.com/MizaGBF/GBFAL) 的 `buffs` 索引，只请求 GBFAL 已确认存在的状态图标及其特殊后缀，避免对 CDN 进行大范围暴力枚举。图片保存到 `IMAGE/status/`；当 `config.ini` 的 `[IMAGE] new=yes` 时，新下载文件也会写入 `IMAGE/new/`。
+`status` 不再依赖 GBFAL 或其他第三方在线索引，而是直接检查 GBF 官方 CDN，并在本地维护 `data/status_index.json`。
+
+- 第一次运行时会按状态图标的 ID 分段建立本地索引，因此耗时会明显长于后续运行。
+- 后续运行会基于本地索引做增量探测，并复查各分段较新的状态 ID，以发现新的状态图标和特殊后缀。
+- 已下载的图片保存在 `IMAGE/status/`；程序也会从该目录已有文件补充本地索引。
+- 当 `config.ini` 的 `[IMAGE] new=yes` 时，新下载文件也会写入 `IMAGE/new/`。
+- 如果需要重新建立完整索引，可以删除 `data/status_index.json` 后再次执行 `image status`。已有的 `IMAGE/status/` 文件仍会被自动识别并加入新索引。
+- 状态图标的 404 不会写入全局 `skip_log.txt`，避免未来新增资源被永久跳过。
 
 # 打包
 脚本使用pyinstaller打包，打包指令附于pack.bat中
